@@ -1,0 +1,90 @@
+# Build the container, push to ACR, deploy to the Container App.
+#   • dev  : builds + deploys automatically on every push to main.
+#   • prod : promotes the SAME image, but is GATED behind a manual approval
+#            (GitHub Environment 'prod' has you as a required reviewer).
+#
+# Auth is OIDC — no secrets. The OIDC token's subject is bound to the job's
+# `environment:`, which is why BOTH jobs declare one (the federated credentials
+# provisioned for this repo are subject=repo:<owner>/<repo>:environment:<env>).
+# All other values come from repo *variables* the platform portal set.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC federated login to Azure
+  contents: read
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # Build + push + deploy to dev in one job so the OIDC subject is environment:dev.
+  deploy-dev:
+    runs-on: ubuntu-latest
+    environment: dev            # auto-deploys (no protection rule)
+    # Skip cleanly until the platform has wired the repo (the initial template
+    # commit triggers this workflow before variables exist — don't fail red).
+    if: ${{ vars.AZURE_CLIENT_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build & push image to ACR
+        run: |
+          az acr login --name "${{ vars.ACR_NAME }}"
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/${{ vars.PROJECT }}:${IMAGE_TAG}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Wire ACR pull via managed identity (idempotent)
+        run: |
+          az containerapp registry set \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --server "${{ vars.ACR_LOGIN_SERVER }}" \
+            --identity system
+
+      - name: Deploy to Container App (dev)
+        run: |
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/${{ vars.PROJECT }}:${IMAGE_TAG}"
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "$IMAGE" \
+            --set-env-vars ENVIRONMENT=dev
+          # Point ingress at the app's port (idempotent).
+          az containerapp ingress update \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --target-port 8000
+
+  deploy-prod:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: prod           # GATED: required reviewer must approve
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Promote to Container App (prod) — same image tag
+        run: |
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/${{ vars.PROJECT }}:${IMAGE_TAG}"
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "$IMAGE" \
+            --set-env-vars ENVIRONMENT=prod
